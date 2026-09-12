@@ -65,6 +65,13 @@ cp scripts/auto-quality.lua ~/.config/mpv/scripts/
 | `Ctrl+i` | 手动切插帧（同上） |
 | `Ctrl+t` | 色调映射曲线三档循环：hable / bt.2390 / spline |
 
+**诊断**（可选，但强烈建议 —— 否则闭环到底有没有动，你永远不会知道）
+
+见第 7 节。最小配置就是 `mpv.conf` 末尾两行 `log-file` + `input-ipc-server`。
+> Linux / macOS 的 IPC 路径写成 `input-ipc-server=/tmp/mpv-ipc`。
+>
+> ⚠️ 管道名只能被一个实例占用，`log-file` 是覆盖写 —— 用之前先读 7.3 的两条硬纪律。
+
 ---
 
 ## 3. 色彩链：HDR/DV → SDR 的取舍
@@ -183,10 +190,35 @@ local WIDTH_4K         = 3800   -- 4K 判定阈值
 | display-sync 模式下丢帧计数仍有效（`vo.c` 里 `num_vsyncs < 1` 这条路径） | [实证] |
 | `d3d11-output-csp=srgb` 与默认 `auto` 生效值等价 | [实证] |
 | `hdr-reference-white` 生效值为 `auto`，不覆盖 `target-peak=250` | [实证] |
-| **降级/回升闭环从未真跑过一次** | **[未实证]** |
-| 阈值 `1.0 帧/s` / `CONFIRM=2` / `60s` 全是拍的，未标定 | [未实证] |
+| **降档闭环真跑过**：加压后 `full → emergency`，日志 `AUTO-QUALITY -> emergency (丢帧159.9/s)` | **[实证]** |
+| **回升闭环真跑过**：卸压后 `emergency → full`，日志 `AUTO-QUALITY -> full (自动回升)` | **[实证]** |
+| 降档时机符合设计：连续 2 个采样周期（≈6~9s）超阈值才降 | [实证] |
+| 回升时机符合设计：卸压后约 66s 回升（`CLEAN_SECONDS=60` + 采样粒度） | [实证] |
+| `mpv --log-file` 恒定按 debug 级写，`--msg-level` 管不着 | [实证] |
+| IPC 可用：能读 `frame-drop-count` / 托管键 / `user-data/auto-quality/*` | [实证] |
+| 阈值 `1.0 帧/s` / `CONFIRM=2` / `60s` **在真实片源上是否合适，仍未标定** | **[未实证]** |
+| 1440p / 2.5K 落 `full` 档是否合理 | [未实证] |
 
-闭环没跑过的原因很实在：**没法在不打扰实际观看的前提下构造"持续丢帧"场景。**
+### 5.1 闭环验证是怎么做出来的
+
+`tools/loop_test.py` —— 之前测不了，是因为「没法在不打扰观看的前提下构造持续丢帧」。解法是用 IPC 把负载**做成可控的**：
+
+```
+基线(full) → set speed 8 → 丢帧 → 降档(emergency) → set speed 1 → 干净 → 回升(full)
+```
+
+实测一轮（1080p H.264，`--vo=null` 无窗口）：
+
+| 阶段 | 观测 |
+|---|---|
+| 基线 | `tier=full`，`frame-drop-count=0` |
+| 加压 `speed=8` | t=3s 丢 267 帧；t=6s 丢 754 帧（仍 full，bad_streak=1）；**t=9s → emergency** |
+| 加压结束 | 累计丢 1721 帧，档位 emergency |
+| 卸压 `speed=1` | 丢帧停在 2150 不再增长；**t≈66s → full（自动回升）** |
+
+**降档和回升都按设计触发。** 这是本策略第一次拿到端到端实证。
+
+⚠ **但这不等于阈值标定完成。** 人工 `speed=8` 压出来的丢帧率是 **137~160 帧/s**，比 `DROP_THRESHOLD=1.0` 高两个数量级 —— 只证明了「远超阈值时会降、干净够久会升」，**没有回答「1.0 帧/s 这个阈值在真实卡顿下合不合适」**。那个仍然要在真卡顿的片子上看 `logcheck.py` 的采样分布来定。
 
 ---
 
@@ -210,18 +242,97 @@ local WIDTH_4K         = 3800   -- 4K 判定阈值
 
 ⑨ **读 mpv 实际生效的选项值**：`mpv --idle --vo=null --script=<dump.lua>`，脚本里用 `mp.get_property("options/<名>")` 逐个打印。注意 Lua 的 `print` 走 info 级，必须配 `--msg-level=all=info` 才看得到。
 
+⑩ **`--log-file` 恒定按 debug 级写，`--msg-level` 管不着它** —— `--msg-level=all=no` 也照样写满 276 行。别在配置里写 `msg-level` 试图降噪，那是个无效开关（写进去只会误导下一个读配置的人）。
+
+⑪ **`input-ipc-server` 先到先得 + `--log-file` 覆盖写 = 测试会劫持用户**（真实事故，不是理论风险）：测试实例若沿用默认管道名，会连上用户正在看的那个 mpv，然后对着用户的播放发命令；同时以覆盖模式打开用户的日志文件，把那一场的日志整段截断。**测试必须用独立管道名 + 独立日志路径**，且连上后核对 `filename` 是不是自己要放的片源。
+
+⑫ **mpv 会在同一根 IPC 管道上主动推事件**（`start-file` / `playback-restart` / `end-file` / `property-change`）。朴素的「写一条、读一行」会把事件当成响应，请求与应答就此错位 —— 症状是读 `frame-drop-count` 却拿到 `bilinear`（上一条 `cscale` 的值）。**必须带 `request_id` 按 id 配对。**
+
+⑬ **单写者脚本需要「漂移自愈」，光在分辨率变化时重新套用是不够的**：`pick_baseline()` 若只在「width 跨过 3800」时才动手，那么属性一旦被外部改乱（IPC 直接 `set`、别的脚本、mpv 内置的 `b` 键 `cycle deband`），就会**永久停在混合态** —— 实测踩到 `scale=ewa_lanczossharp` 配 `dscale=bilinear`、`linear-downscaling=no`，不属于任何一档。v5.6 起：基线未变但托管键与当前档位不符时，自动重新套用。
+
+⑭ **档位别靠反推，让脚本自己报**：v5.6 起内部状态外露成 `user-data/auto-quality/{tier,baseline,auto}`，`mpvctl.py get` 直接读。反推在混合态下必然误判（见 ⑬）。
+
 ---
 
-## 7. 已知未验证面（欢迎审计）
+## 7. 诊断：怎么知道闭环有没有动
+
+这是本仓库最容易被跳过、但实际最要紧的一节。
+
+**mpv 默认不写日志文件，也不开放任何外部接口。** 所以「播了一场之后回头查闭环到底触发没有」在原始状态下根本做不到 —— 这个策略的降档/回升逻辑因此长期停在「未验证」。下面三样东西就是为了让它可查。
+
+### 7.1 打开日志与 IPC
+
+`mpv.conf` 末尾两行：
+
+```ini
+log-file="~~/mpv.log"                      # ~~/ = 配置目录；每次启动覆盖写
+input-ipc-server="\\.\pipe\mpv-ipc"        # Windows；Linux/macOS 用 /tmp/mpv-ipc
+```
+
+⚠ **两个实测坑**：
+
+| 坑 | 实测结论 |
+|---|---|
+| 想用 `msg-level` 降低日志详细度 | **无效**。日志文件恒定按 debug 级写 —— `--msg-level=all=no` 也照样写满 276 行。要精简只能用过滤脚本。 |
+| 日志体积 | 启动有一波 275~385 行的固定突刺，稳态约 20~30 行/秒 → 一集 45 分钟约几 MB。覆盖写，不跨会话累积（连跑两次均 275 行）。 |
+
+脚本报档位走 `mp.msg.warn`，日志里的模块前缀是 `[auto_quality]`。
+
+### 7.2 三个工具（`tools/`）
+
+| 工具 | 干什么 |
+|---|---|
+| `mpvctl.py` | 通过 IPC 读运行中实例的实时状态：片源 / 分辨率 / 硬解 / 丢帧 / **脚本自报档位** / 6 个托管键。也能 `set`、发任意命令 |
+| `logcheck.py` | 从几万行 debug 噪声里提取闭环证据：档位变更时间线、丢帧率分布直方图、闭环触发判定 |
+| `loop_test.py` | **闭环端到端验证台**：用 IPC 控制 `speed` 可控地制造/撤除负载，把「基线 → 加压 → 降档 → 卸压 → 回升」四阶段全跑一遍 |
+
+```bash
+python tools/mpvctl.py status                  # 对着正在播的片子看一眼
+python tools/logcheck.py                       # 分析上一场的日志
+python tools/loop_test.py --video test.mp4     # 主动把闭环跑一遍
+```
+
+### 7.3 ⚠ 用 IPC 的两条硬纪律（都是踩出来的）
+
+**一、测试必须用独立管道名 + 独立日志路径。**
+
+`input-ipc-server` 是**先到先得**的，`--log-file` 是**覆盖写**的。测试若沿用默认名字，而用户正在用同一个名字看片：
+
+- 测试会**连上用户的实例**，然后对着用户的播放发 `set speed 8` —— 用户画面突然 8 倍速，测试拿到的也全是别人的数据；
+- 测试实例启动时**以覆盖模式打开用户的日志文件**，把用户那一场的日志整段截断（日志里会留下 NUL 空洞）。
+
+`loop_test.py` 现在默认用 `\\.\pipe\mpv-ipc-looptest` + 临时目录日志，并在连上后**核对 `filename` 是不是本次要放的片源**，不匹配直接中止退出。
+
+**二、mpv 会在同一根管道上主动推事件。**
+
+朴素的「写一条、读一行」会把 `start-file` / `playback-restart` 这类事件当成响应，请求与应答就此错位 —— 症状是读 `frame-drop-count` 却拿到 `bilinear`（那是上一条 `cscale` 的返回值）。必须给每条命令带 `request_id` 并按 id 配对；两个工具都实现了。
+
+### 7.4 档位读取：别反推
+
+`auto-quality.lua` v5.6 起把内部状态外露成属性，**直接读**：
+
+```bash
+python tools/mpvctl.py get user-data/auto-quality/tier    # full / light / emergency
+python tools/mpvctl.py get user-data/auto-quality/auto    # 自动档还开着没
+```
+
+在此之前只能拿 6 个托管键的值**反推**档位 —— 遇到混合态会给出错误结论。实测踩到过：`scale=ewa_lanczossharp` 配 `dscale=bilinear`、`linear-downscaling=no`，**不属于任何一档**。
+
+混合态的成因是 v5.6 之前的一个真实缺陷：`pick_baseline()` 只在「分辨率跨过 3800」时才重新套用档位，所以属性一旦被外部改乱（IPC 直接 `set` / 别的脚本 / mpv 内置的 `b` 键 `cycle deband`），就会永久停在那儿，直到下次分辨率变化。v5.6 加了**漂移自愈**：基线未变、但托管键与当前档位不符时，自动重新套用。
+
+---
+
+## 8. 已知未验证面（欢迎审计）
 
 按优先级：
 
-1. **[最高] 闭环未验证** —— 想办法构造可控丢帧（播放时并行压 GPU、或真卡顿时查日志有没有 `AUTO-QUALITY -> emergency`），确认降档真触发、回升真不横跳。
-2. **[最高] 阈值未标定** —— 建议先实测"已知流畅"的片子上 `frame-drop-count` 基线值是多少，再定 `DROP_THRESHOLD`。6s 反应延迟对看片卡顿可能太慢；1 帧/s 也可能把 24fps→60Hz 的正常抖动误判成卡。
+1. ~~**[最高] 闭环未验证**~~ → **✅ 已解决（见 5.1）**：`tools/loop_test.py` 用 IPC 控制 `speed` 构造可控负载，降档/回升双向都跑通了。
+2. **[最高] 阈值仍未标定** —— 5.1 的人工负载是 137~160 帧/s，比 `DROP_THRESHOLD=1.0` 高两个数量级，**只证明了机制成立，没证明阈值合适**。要做的是：在**已知流畅**的片子上跑一场，用 `logcheck.py` 看采样分布，确认 `1.0 帧/s` 不会把 24fps→60Hz 的正常抖动误判成卡；再看真实卡顿片子的采样值，确认 6s 反应延迟（`CONFIRM=2` × 3s）对看片够不够快。
 3. **`frame-drop-count` 语义是否含容器可变帧率（VFR）导致的正常丢帧？** 若是，动画/VFR 片会被误判。
 4. **1440p / 2.5K（2560-3799）落 `full` 档**，`cscale=ewa` 在降采样场景白跑。比 4K 轻 4 倍大概率无碍，但未测。
 5. **有没有更对症的原生旋钮？** 比如 mpv 是否已有原生 ABR/动态降级机制，或 `--demuxer-max-back-bytes`、解码线程优先级。有原生就该替换这套手写闭环。
 6. **档位是否该写进 `mpv.conf` 的 `profile` 而不是 Lua 逐属性 set？** 更可维护，但受限于坑①。
+7. **`--vo=null` 下的验证能否代表真实渲染路径？** 5.1 用的是 `--vo=null`（避免弹窗、也不打扰正在看的片子），丢帧发生在解码侧；真实 `gpu-next` 渲染下的丢帧模式可能不同。真机复验建议直接对正在播的片子用 `mpvctl.py watch` 盯着看。
 
 ---
 
@@ -241,4 +352,17 @@ MIT —— 见 [LICENSE](LICENSE)。随意取用、修改、再发布，不担�
 把**空转选项**（写了等于没写）和**真实旋钮**区分开，再决定哪些恢复、哪些注释停用。
 
 所以本仓库里的每一行都带出处：`[实证]` = 本机实测或源码/文档核对过；
-`[未实证]` = 经验值，等你来推翻。审计待办列在 README 第 7 节。
+`[未实证]` = 经验值，等你来推翻。审计待办列在第 8 节。
+
+### 然后是「把未验证面做掉」
+
+配置修完之后，最刺眼的是一句 `[未实证]`：**丢帧闭环从 v5 起就没跑过一次**。
+原因很实在 —— mpv 默认不写日志、不开接口，而「构造持续丢帧」又会打扰实际观看。
+
+解法不是去猜，而是**把观测面打开**：加 `log-file` + `input-ipc-server`（第 7 节），
+再写三个工具。最后用 `loop_test.py` 通过 IPC 控制 `speed` 把负载做成可控的，
+一轮跑完 `full → emergency → full`（5.1 节）。
+
+同一轮里也踩了两个新坑并且都写进第 6 节：`--log-file` 恒定 debug 级（`msg-level` 无效），
+以及 `input-ipc-server` 先到先得 + `--log-file` 覆盖写导致**测试劫持了正在播放的实例**（⑪）。
+后者是真实事故，不是理论风险 —— 所以 `loop_test.py` 里现在有一道「核对片源」的安全闸。

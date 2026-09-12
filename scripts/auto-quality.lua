@@ -1,4 +1,4 @@
--- auto-quality.lua v5.4 (2026-09-13 Nyx)
+-- auto-quality.lua v5.6 (2026-09-13 Nyx)
 -- 单写者自动画质档 = 分辨率定基线（v4 路线，9-06 实测有效）+ 丢帧率闭环自适应（v5 新增）。
 --
 -- 为什么必须单写者: 外挂第二个按丢帧切档的脚本(auto-smooth.lua)会与 v4 抢同一批属性，
@@ -18,6 +18,18 @@
 --        原因：这两个键改的正是本脚本托管的那批属性，而 enter() 每次换档会按
 --        档位表整组重写 —— 手动改动会在下一次换档时被静默覆盖（本脚本是单写者，
 --        键位就该归它管）。原绑定在 input.conf，已移出，见该文件注释。
+--   v5.5 每次采样打一行 debug 日志（rate/drops/tier/baseline/stutter）。
+--        目的：闭环的降档/回升到底有没有触发、阈值定得对不对，一直无从验证
+--        （mpv 默认不写日志）。实测 mpv 的 --log-file 恒定按 debug 级写、
+--        --msg-level 管不着它，所以 debug 级这行必然落进 mpv.log。
+--        要精简单独关掉：--msg-level=auto_quality=no（该开关只影响终端/该模块）。
+--   v5.6 ① 状态外露：内部状态写进 user-data/auto-quality/{tier,baseline,auto}，
+--           外部（IPC）能直接读到真实档位。之前只能拿托管属性的值去反推，
+--           遇到混合态会给出错误结论（实测：scale=ewa 但 dscale=bilinear）。
+--        ② 漂移自愈：基线没变、但托管键被外部改动过 → 重新套用当前档位。
+--           旧版 pick_baseline 只在「分辨率跨过 3800」时才动手，所以一旦
+--           属性被外部改乱（IPC 直接 set / 别的脚本 / mpv 内置 b 键 cycle deband），
+--           就会永久停在混合态，直到下次分辨率变化。这是实打实踩到的坑。
 --
 -- 硬件: i7-8550U + UHD620(带屏) + MX250 + 1080p SDR 屏。
 -- ⚠ 坑(勿回退): mpv 0.41 + d3d11va 下 video-params/* 全读 nil，必须用别名 width。
@@ -73,6 +85,35 @@ local function set1(k, v)
   if not ok then mp.msg.warn("auto-quality: set " .. k .. " failed: " .. tostring(err)) end
 end
 
+-- v5.6 状态外露：把内部状态写进 user-data/*，供 IPC 直接读取。
+-- 读法：python mpvctl.py get user-data/auto-quality/tier
+-- 别再靠托管属性反推档位 —— 混合态下会误判。
+local function publish()
+  mp.set_property_native("user-data/auto-quality/tier", tier or "none")
+  mp.set_property_native("user-data/auto-quality/baseline", baseline or "none")
+  mp.set_property_native("user-data/auto-quality/auto", auto)
+end
+
+-- v5.6 托管键是否与某档一致（用于漂移自愈）。
+-- 注意类型：scale/cscale/dscale 是字符串，其余三个是布尔。
+local function keys_match(t)
+  for _, k in ipairs(KEYS) do
+    local cur = mp.get_property_native(k)
+    local want = t[k]
+    local same
+    if type(want) == "string" and (want == "yes" or want == "no") then
+      same = (cur == (want == "yes"))     -- "yes" -> true
+    else
+      same = (tostring(cur) == tostring(want))
+    end
+    if not same then
+      mp.msg.verbose(string.format("drift: %s is %s, tier wants %s", k, tostring(cur), tostring(want)))
+      return false
+    end
+  end
+  return true
+end
+
 local function enter(new_tier, why)
   if tier == new_tier then return end
   tier = new_tier
@@ -81,6 +122,7 @@ local function enter(new_tier, why)
   bad_streak, clean_accum = 0, 0
   mp.msg.warn(string.format("AUTO-QUALITY -> %s (%s)", new_tier, why))
   mp.osd_message("画质档: " .. tier_label[new_tier] .. " (" .. why .. ")", 2)
+  publish()
 end
 
 -- 分辨率 → 基线档。width 未知(0)时不改判，等 video-reconfig/observe 补触发。
@@ -92,7 +134,13 @@ local function pick_baseline(why)
     baseline = nb
     tier = nil            -- 基线变了 => 允许重新套用（含从 emergency 回落到新基线）
     enter(nb, why .. " width=" .. tostring(w))
+  elseif auto and tier and not keys_match(tier_table[tier]) then
+    -- v5.6 自愈：基线未变但托管键被改乱 → 重新套用当前档位
+    local keep = tier
+    tier = nil
+    enter(keep, "检测到托管键漂移，重新套用")
   end
+  publish()
 end
 
 mp.register_event("file-loaded", function()
@@ -116,6 +164,11 @@ mp.add_periodic_timer(SAMPLE_INTERVAL, function()
   local rate = (drops - prev_drops) / dt
   prev_drops, prev_time = drops, now
   local stutter = rate > DROP_THRESHOLD
+
+  -- v5.5 采样落日志：标定 DROP_THRESHOLD 的唯一数据来源（见文件头 v5.5 说明）。
+  mp.msg.debug(string.format(
+    "sample rate=%.2f/s drops=%d dt=%.1fs tier=%s baseline=%s stutter=%s",
+    rate, drops, dt, tostring(tier), tostring(baseline), tostring(stutter)))
 
   if tier == baseline then
     if stutter then
@@ -150,6 +203,7 @@ end)
 mp.add_key_binding("ctrl+a", "toggle-auto-quality", function()
   auto = not auto
   mp.osd_message("自动画质档: " .. (auto and "开" or "关"), 2)
+  publish()
 end)
 
 -- v5.4 手动覆盖：改托管属性前先关掉自动档，否则下一次换档会整组写回。
@@ -157,6 +211,7 @@ end)
 local function manual_override()
   if not auto then return false end
   auto = false
+  publish()
   return true
 end
 
@@ -175,3 +230,6 @@ mp.add_key_binding("ctrl+i", "toggle-interpolation-manual", function()
   mp.osd_message("interpolation: " .. (on and "关" or "开") ..
                  (was_auto and " ｜ 自动画质档已关" or ""), 3)
 end)
+
+-- 初始状态外露（脚本加载完就能被 IPC 读到）
+publish()
