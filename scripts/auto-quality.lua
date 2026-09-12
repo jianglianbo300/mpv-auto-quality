@@ -1,4 +1,4 @@
--- auto-quality.lua v5.7 (2026-09-13 Nyx)
+-- auto-quality.lua v5.8 (2026-09-13 Nyx)
 -- 单写者自动画质档 = 分辨率定基线（v4 路线，9-06 实测有效）+ 丢帧率闭环自适应（v5 新增）。
 --
 -- 为什么必须单写者: 外挂第二个按丢帧切档的脚本(auto-smooth.lua)会与 v4 抢同一批属性，
@@ -44,6 +44,18 @@
 --        副作用（已知、可接受）：真实卡顿的响应延迟 +N 秒。
 --        附带现象：换档重建 filter chain 会让 frame-drop-count 归零，采样里出现
 --        -30.54/s 这类负值（负值不会被判成 stutter，但会掩盖编译期真实丢帧）。
+--   v5.8 ① 应急档非法值修正：原写 scale="fast_bilinear" —— 那是【旧 vo=gpu 后端】
+--            的缩放器名，gpu-next / libplacebo 下非法，v0.41 已彻底移除。
+--            后果：降档时该键 set 静默失败（用户真实日志三次降档全报
+--            [f][cplayer] Invalid value for option scale: fast_bilinear），
+--            档位照样切、OSD 照样提示，唯独最重的 scale 根本没换掉
+--            —— 降档形同虚设。这才是「降了还是卡」的直接原因。
+--            改用 bilinear；dscale 由 bilinear 改 oversample（专为降采样优化，
+--            实测 4K DV 300 帧 oversample 23.4fps vs bilinear 21.3fps）。
+--        ② 档位表启动自检 validate_tiers()：借只读属性 option-info/<键>/choices
+--            校验每个字符串值是否为当前后端合法值，非法则 error 级告警。
+--            时机放在 file-loaded（此时 VO 已就绪、choices 可读）；
+--            只有真的读到 choices 才算校验过，否则留待下次触发重试。
 --
 -- 硬件: i7-8550U + UHD620(带屏) + MX250 + 1080p SDR 屏。
 -- ⚠ 坑(勿回退): mpv 0.41 + d3d11va 下 video-params/* 全读 nil，必须用别名 width。
