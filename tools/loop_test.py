@@ -33,6 +33,9 @@ DROP_THRESHOLD = 1.0
 CONFIRM = 2
 SAMPLE_INTERVAL = 3
 CLEAN_SECONDS = 60
+# v5.7 起脚本有换档/起播静默期（SETTLE_SECONDS，默认 10s），期间采样不参与判定。
+# 所以加压窗口必须覆盖 静默期 + 降档确认期，否则测不出降档（详见 --load-seconds 说明）。
+SETTLE_SECONDS = 10
 
 MANAGED = ["scale", "cscale", "dscale", "linear-downscaling", "deband", "interpolation"]
 
@@ -179,17 +182,21 @@ def main():
     ap.add_argument("--log", default=test_log(),
                     help="测试专用日志（默认写到临时目录，勿指向用户的 mpv.log）")
     ap.add_argument("--speed", type=float, default=8.0, help="加压用的倍速")
-    ap.add_argument("--load-seconds", type=float, default=12.0,
-                    help="加压持续时长（需 >= (CONFIRM+1)*SAMPLE_INTERVAL）")
+    ap.add_argument("--load-seconds", type=float,
+                    default=SETTLE_SECONDS + (CONFIRM + 2) * SAMPLE_INTERVAL,
+                    help="加压持续时长。必须 >= 静默期(SETTLE_SECONDS=%d) + "
+                         "(CONFIRM+1)×SAMPLE_INTERVAL(%d)，否则降档还没确认加压就结束了"
+                         % (SETTLE_SECONDS, (CONFIRM + 1) * SAMPLE_INTERVAL))
     ap.add_argument("--clean-seconds", type=float, default=CLEAN_SECONDS + 15,
                     help="卸压后等待时长（需 > CLEAN_SECONDS）")
     ap.add_argument("--keep-log", action="store_true")
     a = ap.parse_args()
 
-    need = (CONFIRM + 1) * SAMPLE_INTERVAL
+    need = SETTLE_SECONDS + (CONFIRM + 1) * SAMPLE_INTERVAL
     if a.load_seconds < need:
-        print("⚠ --load-seconds=%.0fs 偏短，建议 >= %.0fs（(CONFIRM+1)×SAMPLE_INTERVAL）"
-              % (a.load_seconds, need))
+        print("⚠ --load-seconds=%.0fs 偏短，建议 >= %.0fs"
+              "（静默期 %d + (CONFIRM+1)×SAMPLE_INTERVAL %d）"
+              % (a.load_seconds, need, SETTLE_SECONDS, (CONFIRM + 1) * SAMPLE_INTERVAL))
     if a.clean_seconds <= CLEAN_SECONDS:
         print("⚠ --clean-seconds=%.0fs 必须 > CLEAN_SECONDS=%d，否则测不出回升"
               % (a.clean_seconds, CLEAN_SECONDS))

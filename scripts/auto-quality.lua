@@ -1,4 +1,4 @@
--- auto-quality.lua v5.6 (2026-09-13 Nyx)
+-- auto-quality.lua v5.7 (2026-09-13 Nyx)
 -- 单写者自动画质档 = 分辨率定基线（v4 路线，9-06 实测有效）+ 丢帧率闭环自适应（v5 新增）。
 --
 -- 为什么必须单写者: 外挂第二个按丢帧切档的脚本(auto-smooth.lua)会与 v4 抢同一批属性，
@@ -30,6 +30,20 @@
 --           旧版 pick_baseline 只在「分辨率跨过 3800」时才动手，所以一旦
 --           属性被外部改乱（IPC 直接 set / 别的脚本 / mpv 内置 b 键 cycle deband），
 --           就会永久停在混合态，直到下次分辨率变化。这是实打实踩到的坑。
+--   v5.7 换档后静默期（SETTLE_SECONDS）：真实播放日志暴露的振荡修复。
+--        事故：720p 片源播到 0:33 触发降档 -> emergency，随后 34.1~37.5s 出现
+--        libplacebo 重编译 shader（单次最慢 1199.7ms，日志 "translating HLSL to
+--        DXBC (slow!)"）-> 编译期渲染停滞、frame-drop-count 暴涨（8 秒丢 134 帧）
+--        -> 这些丢帧被当成"还在卡"继续计入 bad_streak/clean_accum。
+--        更糟的是回升：emergency 干净 60s -> 回升 full -> full 档重型 shader
+--        （ewa_lanczossharp+deband）重新编译 -> 编译期丢帧 -> 2~3 秒内又超阈值
+--        -> 立刻降回 emergency。日志里 1:40 回升 / 1:42 复发、2:42 回升 / 2:45
+--        复发，就是这么来的（full <-> emergency 振荡）。
+--        结论：「改画质属性」本身有成本，而这个成本会被误判成「画质没救回来」。
+--        修法：换档/起播后 N 秒内只记录采样、不参与判定（基准仍推进）。
+--        副作用（已知、可接受）：真实卡顿的响应延迟 +N 秒。
+--        附带现象：换档重建 filter chain 会让 frame-drop-count 归零，采样里出现
+--        -30.54/s 这类负值（负值不会被判成 stutter，但会掩盖编译期真实丢帧）。
 --
 -- 硬件: i7-8550U + UHD620(带屏) + MX250 + 1080p SDR 屏。
 -- ⚠ 坑(勿回退): mpv 0.41 + d3d11va 下 video-params/* 全读 nil，必须用别名 width。
@@ -41,6 +55,11 @@ local CLEAN_SECONDS    = 60     -- 应急档连续 N 秒零丢帧才试探回升
 local RECHECK_SECONDS  = 25     -- 回升后观察 N 秒, 立刻复发记一次失败
 local COOLDOWN_SECONDS = 300    -- 连续 2 次回升失败 => 冷却 N 秒不再回升
 local WIDTH_4K         = 3800   -- 4K 判定阈值（v4 沿用）
+-- v5.7 静默期：换档/起播后 N 秒内只记录、不判定。
+--   依据（实测日志）：换档到 frame-drop-count 稳定约需 9 秒
+--   （33.8s 换档 -> 34.1~37.5s 编译 -> 42.7s 计数器归零）。取 10 留余量。
+--   调小 => 真实卡顿反应快，但可能重新引入振荡；调大 => 更稳，但响应慢。
+local SETTLE_SECONDS   = 10
 
 -- 托管键: 每档必须显式给出每个键的值（单一事实源，防跨档残留）
 local KEYS = { "scale", "cscale", "dscale", "linear-downscaling", "deband", "interpolation" }
@@ -67,6 +86,7 @@ local auto = true
 local prev_drops, prev_time = nil, nil
 local bad_streak, clean_accum = 0, 0
 local upgrade_pending, fail_count, blocked_until = nil, 0, 0
+local settle_until = 0           -- v5.7 静默期截止时刻（mp.get_time() 基准）
 
 local function get_num(name)
   local ok, n = pcall(mp.get_property_number, name)
@@ -120,6 +140,7 @@ local function enter(new_tier, why)
   local t = tier_table[new_tier]
   for _, k in ipairs(KEYS) do set1(k, t[k]) end
   bad_streak, clean_accum = 0, 0
+  settle_until = mp.get_time() + SETTLE_SECONDS   -- v5.7 换档自身有成本，先静默
   mp.msg.warn(string.format("AUTO-QUALITY -> %s (%s)", new_tier, why))
   mp.osd_message("画质档: " .. tier_label[new_tier] .. " (" .. why .. ")", 2)
   publish()
@@ -147,6 +168,9 @@ mp.register_event("file-loaded", function()
   prev_drops, prev_time = read_drops(), mp.get_time()
   bad_streak, clean_accum, upgrade_pending = 0, 0, nil
   fail_count, blocked_until = 0, 0
+  -- v5.7 起播同样有首次全量 shader 编译（实测 5.9~9.4s 共约 2.8s），一并静默。
+  -- 注意：同分辨率换片时 enter() 不会被调用，所以这行不能省。
+  settle_until = mp.get_time() + SETTLE_SECONDS
   pick_baseline("新片源")
 end)
 
@@ -163,6 +187,16 @@ mp.add_periodic_timer(SAMPLE_INTERVAL, function()
   if dt <= 0 then return end
   local rate = (drops - prev_drops) / dt
   prev_drops, prev_time = drops, now
+
+  -- v5.7 静默期：换档/起播后的 shader 重编译开销不算「卡顿」（见文件头 v5.7）。
+  -- 基准 prev_drops 已在上面推进，所以静默期一结束就能立刻拿到正确的 3 秒增量。
+  if now < settle_until then
+    mp.msg.debug(string.format(
+      "settle %.1fs left, skip judgement (rate=%.2f/s drops=%d tier=%s)",
+      settle_until - now, rate, drops, tostring(tier)))
+    return
+  end
+
   local stutter = rate > DROP_THRESHOLD
 
   -- v5.5 采样落日志：标定 DROP_THRESHOLD 的唯一数据来源（见文件头 v5.5 说明）。
