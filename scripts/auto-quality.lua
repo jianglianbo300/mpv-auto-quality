@@ -72,13 +72,64 @@ local LIGHT = {                  -- 4K 基线: 色度低频用 bilinear 无感; 
   scale = "ewa_lanczossharp", cscale = "bilinear", dscale = "mitchell",
   ["linear-downscaling"] = "yes", deband = "no", interpolation = "no",
 }
-local EMERGENCY = {              -- 基线仍喂不动: 砍掉 4K 降采样最大头(线性缩放)+缩放器降双线性
-  scale = "fast_bilinear", cscale = "bilinear", dscale = "bilinear",
+local EMERGENCY = {              -- 基线仍喂不动: 砍掉 4K 降采样最大头(线性缩放)+缩放器降到最便宜
+  -- v5.8 修正非法值：原写 scale="fast_bilinear" —— 那是【旧 vo=gpu 后端】的名字，
+  --   gpu-next / libplacebo 下**非法**。后果：set 失败（用户真实日志里三次降档
+  --   全部记 [f][cplayer] Invalid value for option scale: fast_bilinear），
+  --   于是最重的 scale 根本没被换掉 —— **降档形同虚设**，这正是「降了还是卡」的原因。
+  --   合法名（gpu-next，实测 mpv --scale=ZZZ 拿到的完整列表）：
+  --     bilinear / bicubic_fast / oversample / spline16 / lanczos / mitchell / ...
+  --   dscale 由 bilinear 改 oversample：专为降采样优化，实测更快
+  --     （4K DV 300 帧：oversample 23.4fps vs bilinear 21.3fps）。
+  scale = "bilinear", cscale = "bilinear", dscale = "oversample",
   ["linear-downscaling"] = "no", deband = "no", interpolation = "no",
 }
 
 local tier_table = { full = FULL, light = LIGHT, emergency = EMERGENCY }
 local tier_label = { full = "满血", light = "4K轻量", emergency = "应急(已砍缩放)" }
+
+-- v5.8 启动自检：档位表里的缩放器名必须是【当前 mpv 实际支持】的合法值。
+--   为什么需要：一个非法名（如 v5.7 及以前的 fast_bilinear）会让该键的 set 静默失败，
+--   而档位本身仍然"看起来"切换成功了（tier 变了、OSD 也提示了）—— 最隐蔽的一类 bug：
+--   降档降了个寂寞，用户只觉得"降了还是卡"。
+--   原理：mpv 把每个选项的合法值暴露在 option-info/<名>/choices（只读，不会改属性）。
+--   缩放器类（scale/cscale/dscale）有 choices；flag 类（deband/interpolation/
+--   linear-downscaling）没有，跳过。choices 随当前 VO 变化，所以换成旧 vo=gpu 时
+--   fast_bilinear 会被正确判为合法 —— 自检自动适配后端。
+local tiers_validated = false      -- 自检是否已真正执行（choices 可读才算数）
+local function validate_tiers()
+  if tiers_validated then return 0 end
+  local bad, checked = 0, 0
+  for name, t in pairs(tier_table) do
+    for _, k in ipairs(KEYS) do
+      local v = t[k]
+      if type(v) == "string" and v ~= "yes" and v ~= "no" then
+        local choices = mp.get_property_native("option-info/" .. k .. "/choices")
+        if choices and #choices > 0 then
+          checked = checked + 1
+          local found = false
+          for _, c in ipairs(choices) do
+            if c == v then found = true; break end
+          end
+          if not found then
+            bad = bad + 1
+            mp.msg.error(string.format(
+              "档位表非法值：%s.%s = %q —— mpv 不支持该值，此键会静默设置失败（降档失效！）",
+              name, k, v))
+          end
+        end
+      end
+    end
+  end
+  -- 只有真的读到 choices 才算校验过；否则（VO 未就绪）等下一次触发重试
+  if checked > 0 then
+    tiers_validated = true
+    if bad == 0 then
+      mp.msg.debug(string.format("档位表自检通过：%d 个缩放器名均为当前后端的合法值", checked))
+    end
+  end
+  return bad
+end
 
 local baseline = nil             -- 由片源分辨率决定 (full|light)
 local tier = nil                 -- 当前生效档 (full|light|emergency)
@@ -171,6 +222,8 @@ mp.register_event("file-loaded", function()
   -- v5.7 起播同样有首次全量 shader 编译（实测 5.9~9.4s 共约 2.8s），一并静默。
   -- 注意：同分辨率换片时 enter() 不会被调用，所以这行不能省。
   settle_until = mp.get_time() + SETTLE_SECONDS
+  -- v5.8 档位表自检：此时 VO 已就绪，option-info/*/choices 可读（见 validate_tiers）
+  validate_tiers()
   pick_baseline("新片源")
 end)
 

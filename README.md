@@ -151,11 +151,14 @@ mpv 按**文件名顺序**加载脚本，后加载者赢。曾经有两个脚本
 |---|---|---|---|
 | `full` 满血 | `width < 3800` 基线 | `scale`+`cscale`=`ewa_lanczossharp`、`deband=yes` | 1080p→1080p 屏是**放大**，`ewa_lanczossharp` 是收益项且成本可承受 |
 | `light` 4K轻量 | `width >= 3800` 基线 | `cscale=bilinear`、`deband=no`，保留 `dscale`+`linear-downscaling` | 4K→1080p 是**降采样**，`scale` 根本不参与；`cscale`/`deband` 才是负载大头且画质敏感度低 |
-| `emergency` 应急 | 基线档持续丢帧 | 再砍 `linear-downscaling=no`，`scale`/`dscale` 降双线性 | 牺牲降采样画质换"能动"。兜底档 |
+| `emergency` 应急 | 基线档持续丢帧 | `scale`/`cscale`=`bilinear`、**`dscale=oversample`**、`linear-downscaling=no`、`deband=no` | 牺牲画质换"能动"。兜底档 |
+
+> ⚠ **应急档的 `dscale` 用 `oversample` 而不是 `bilinear`** —— 实测 4K DV 降采样时 `oversample` 更快（23.4 fps vs 21.3 fps），且它"采样所有源像素"，避免降采样混叠。
+> ⚠ **这些值必须与当前 mpv 版本对照校验**：应急档原先写的是 `scale="fast_bilinear"`，那是**旧版 mpv 的值，v0.41 已彻底移除** —— 于是每次降档该键都静默设置失败，**降档形同虚设**。v5.8 已修正并加了启动自检（见坑⑯）。
 
 ### 4.3 闭环参数
 
-全部是脚本顶部的常量，**都是经验值，未经标定**：
+全部是脚本顶部的常量：
 
 ```lua
 local SAMPLE_INTERVAL  = 3      -- 秒: 丢帧采样周期
@@ -164,12 +167,67 @@ local CONFIRM          = 2      -- 连续 N 周期超阈值才降档(防瞬时�
 local CLEAN_SECONDS    = 60     -- 应急档连续 N 秒零丢帧才试探回升
 local RECHECK_SECONDS  = 25     -- 回升后观察 N 秒, 立刻复发记一次失败
 local COOLDOWN_SECONDS = 300    -- 连续 2 次回升失败 => 冷却 N 秒不再回升
+local SETTLE_SECONDS   = 10     -- v5.7: 换档/起播后的静默期(见 5.2)
 local WIDTH_4K         = 3800   -- 4K 判定阈值
 ```
 
 - **降档**：每 3s 读一次 `frame-drop-count` 算速率，> 1 帧/s 连续 2 个周期 → 降 `emergency`
 - **回升**：应急档连续 60s 零丢帧 → 试探回基线；回升后 25s 内复发记 1 次失败；连败 2 次 → 冷却 300s（防临界点反复横跳闪屏）
+- **静默期**（v5.7）：换档/起播后 10s 内只记录采样、不参与判定 —— 因为换档本身会触发 shader 重编译
 - **逃生口**：`Ctrl+a` 关掉自动档
+
+`DROP_THRESHOLD` / `CONFIRM` / `CLEAN_SECONDS` 仍是经验值（真实触发值 2.0~6.6 帧/s，见 5.2）；`SETTLE_SECONDS` 有实测依据（换档到计数器稳定约 9s）。
+
+### 4.4 独显为什么帮不上忙（实测）
+
+本机是 Optimus 混合显卡笔记本：i7-8550U + **Intel UHD 620**（核显，接 1080p 显示器）+ **NVIDIA MX250**（2GB）。
+
+**先看 mpv 到底用了哪块 GPU** —— 日志写得明明白白：
+
+```
+[0.879][v][vo/gpu-next/d3d11] Device Name: Intel(R) UHD Graphics 620
+[0.879][v][vo/gpu-next/d3d11] Device ID: 8086:5917 (rev 07)
+```
+
+`8086` 是 Intel 的 PCI 厂商 ID。**解码（`d3d11va`）和渲染（`gpu-next`）全在核显上，MX250 一点没参与。**
+（mpv 能看到它：`mpv --d3d11-adapter=help` 列出 `Adapter 1: vendor: 4318, description: NVIDIA GeForce MX250`，`4318` = `0x10DE`。）
+
+**那强制用 MX250 会更快吗？实测：不但没快，还更慢。**
+
+| 配置 | 4K DV 300 帧 | 硬解状态 |
+|---|---|---|
+| 默认（核显） | **20.4 fps** | `d3d11va` ✓ |
+| `--d3d11-adapter=NVIDIA` | 19.0 fps | ✗ 初始化失败，回退软解 |
+| ↑ + `--hwdec=nvdec` | 18.6 fps | ✗ 未生效 |
+| ↑ + `--hwdec=auto-safe` | 17.4 fps | `d3d11va-copy`（低效 copy-back） |
+| Vulkan 路径 | 20.5 fps | — |
+
+**三个原因：**
+
+1. **Optimus 的输出链路**：显示器物理接在核显上，无论谁渲染，最终帧都要经核显呈现。MX250 只是把工作挪了个地方，**末端瓶颈没变**。
+2. **MX250 本身不强**：GP108 核心、64-bit GDDR5，显存带宽约 56 GB/s，只比核显（共享 DDR4-2400 双通道 ≈ 38 GB/s）高约 46%。对带宽密集的 4K 处理，这点优势很容易被跨 GPU 拷贝吃掉。
+3. **跨适配器额外开销**：在 dGPU 上创建 D3D11 device 时硬解直接初始化失败（`hevc: Failed setup for format d3d11: hwaccel initialisation returned error`），只能回退软解 —— 反而更慢。
+
+**真正的瓶颈是「4K 本身」，不是「哪块 GPU」：**
+
+| 片源 | 渲染吞吐 |
+|---|---|
+| 1080p H.264 | **197.9 fps** |
+| 4K DV HEVC | 20.4 fps |
+
+同一条管线、同一块核显，1080p 能跑 **198 fps** —— 说明 mpv、驱动、输出链路全都没毛病，纯粹是 4K 的处理量压垮了这台弱机。
+
+**所以：降渲染负载比换 GPU 有用得多。**
+
+| 配置（4K DV 300 帧） | fps | vs 基线 |
+|---|---|---|
+| 默认（`dscale=mitchell`） | 20.4 | — |
+| `dscale=oversample` | 23.4 | +15% |
+| `scale`/`cscale`/`dscale` 全降 bilinear | 27.9 | +37% |
+| **`scale=oversample` + `cscale=bilinear` + `dscale=oversample`** | **33.1** | **+62%** |
+| 再加 `tone-mapping=clip` | 33.0 | 无增益 |
+
+**33.1 fps > 片源 24 fps → 能流畅播。** 应急档的方向是对的 —— 前提是那些值真的设得进去（见坑⑯）。
 
 **色彩链脚本永不触碰**——卡的时候只砍几何与后期，`tone-mapping`/`target-peak`/`hdr-compute-peak` 一个都不动。
 
@@ -203,6 +261,13 @@ local WIDTH_4K         = 3800   -- 4K 判定阈值
 | 阈值 `1.0 帧/s` 在真实片源上「能触发」，但**是否该触发第一次（2.0 帧/s）存疑** | **[未实证]** |
 | 1440p / 2.5K 落 `full` 档是否合理 | [未实证] |
 | 720p 轻片源在 `full` 档断续丢帧（0.66~4.67 帧/s）的真实原因 | [未实证] |
+| mpv 实际用**核显**渲染，MX250 全程闲置（`Device Name: Intel(R) UHD Graphics 620`） | [实证] |
+| 强制用 MX250 渲染**并不更快**（19.0 vs 核显 20.4 fps），且 D3D11 硬解初始化失败 | [实证] |
+| 同一管线 1080p 能跑 **197.9 fps**、4K DV 只有 20.4 fps → 瓶颈是 4K 本身而非 GPU 型号 | [实证] |
+| 应急档缩放器组合（`oversample`+`bilinear`）能到 **33.1 fps**，超过片源 24 fps | [实证] |
+| 应急档原先的 `scale="fast_bilinear"` 是**非法值** → 降档静默失效（v5.8 已修 + 加自检） | [实证] |
+| `tone-mapping=clip` 对 4K DV 吞吐**无增益**（33.0 vs 33.1 fps） | [实证] |
+| `option-info/<名>/choices` 可作为选项合法性的运行时校验源 | [实证] |
 
 ### 5.1 闭环验证是怎么做出来的
 
@@ -278,6 +343,8 @@ emergency 稳定 60s（丢帧全 0）
 
 ⚠ **静默期尚未在真实渲染路径上复验** —— 上面的回归用 `--vo=null`，绕过了 shader 编译。下次真实播放时用 `logcheck.py` 确认「换档后不再出现 `回升后复发`」即可结案。
 
+**同一份日志还暴露了第二个问题，比振荡更隐蔽**：那三次降档**全都失败了** —— 应急档写的 `scale="fast_bilinear"` 是 mpv v0.41 已移除的非法值，于是最重的 `scale` 根本没被换掉。**降档降了个寂寞**，这正是「降了还是卡」的直接原因。已修复并加了启动自检，详见坑⑯。
+
 完整分析见 [`_evidence/2026-09-13-真实播放闭环分析.md`](_evidence/2026-09-13-真实播放闭环分析.md)（附日志快照与证据行定位）。
 
 ---
@@ -313,6 +380,10 @@ emergency 稳定 60s（丢帧全 0）
 ⑭ **档位别靠反推，让脚本自己报**：v5.6 起内部状态外露成 `user-data/auto-quality/{tier,baseline,auto}`，`mpvctl.py get` 直接读。反推在混合态下必然误判（见 ⑬）。
 
 ⑮ **「改画质属性」本身是有成本的，而且成本会被误判成「画质没救回来」**（真实播放踩到）：切换 `scale` / `cscale` / `dscale` 会让 libplacebo 重新编译 shader 链，实测单次最长 **1199.7 ms**，期间渲染停滞、`frame-drop-count` 暴涨（一次降档后 8 秒内丢 134 帧）。一个「丢帧 → 降档 → 观察丢帧」的闭环如果不给换档留静默期，就会**自己触发自己的降档条件**，形成 full ⇄ emergency 振荡。附带现象：换档重建 filter chain 会让 `frame-drop-count` **归零**，采样里出现 `-30.54/s` 这类负值 —— 负值虽然不会被判成 stutter，但它掩盖了编译期的真实丢帧。**任何「调参 → 观察效果」的闭环都要先扣除调参动作自身的开销。**
+
+⑯ **档位表里的选项值必须与当前 mpv 版本对照校验 —— 一个非法值会让降档「静默失效」**（真实播放踩到，最隐蔽的一类 bug）：应急档原先写的是 `scale="fast_bilinear"`，那是**旧版 mpv 的缩放器名，v0.41 已彻底移除**（`--scale=fast_bilinear` 直接 `Fatal error`，新旧后端都不认）。后果：降档时 `mp.set_property("scale", "fast_bilinear")` **失败**，但——档位照样切了、OSD 照样提示了、`bad_streak` 照样清零了，**唯独最重的 `scale` 根本没换掉**。用户真实日志里三次降档全部记着同一行 `[f][cplayer] Invalid value for option scale: fast_bilinear`，而表象是「降了还是卡」。附带风险：`keys_match()` 会永远返回 false → 一旦 `pick_baseline` 被触发就反复「漂移自愈」，反复触发 shader 重编译。
+　　防御（v5.8 已实施）：mpv 把每个选项的合法值暴露在**只读**属性 `option-info/<名>/choices` 上（`scale` 39 个、`cscale`/`dscale` 各 40 个；`deband`/`interpolation` 这类 flag 没有 choices，跳过）。启动时逐个比对档位表，不合法就 `mp.msg.error` 点名报出。**该属性随当前 VO 变化**，所以换回旧 `vo=gpu` 时自检会自动适配。
+　　**普适推论：凡「把配置值写进代码再交给程序执行」的地方，都要有一步「程序认不认这个值」的校验 —— 否则错误会被执行层吞掉，只在行为上留下一个说不清的「没生效」。**
 
 ---
 
@@ -390,13 +461,14 @@ python tools/mpvctl.py get user-data/auto-quality/auto    # 自动档还开着�
 
 1. ~~**[最高] 闭环未验证**~~ → **✅ 已解决（见 5.1 + 5.2）**：`tools/loop_test.py` 用 IPC 控制 `speed` 构造可控负载双向跑通；随后一份真实播放日志（3 分 25 秒）确认降档 / 回升 / 冷却三条路径在真实负载下全部触发。
 2. ~~**[最高] 振荡修复未实施**~~ → **✅ 已修复（v5.7 静默期，见 5.2）**，回归测试通过；**但尚未在真实 `gpu-next` 渲染路径上复验**（`--vo=null` 绕过 shader 编译）—— 下次真实播放看 `logcheck.py` 是否还出现「回升后复发」即可结案。
-3. **[高] 阈值仍未标定** —— 真实数据把范围收窄了：真实触发时的丢帧率是 **2.0 / 5.64 / 6.64 帧/s**，`DROP_THRESHOLD=1.0` 会抓住全部三次，但第一次（2.0/s）是否**该**触发存疑。还需在**已知流畅**的片子上跑一场，用 `logcheck.py` 看采样分布，确认不会把 24fps→60Hz 的正常抖动误判成卡。
-4. **720p 轻片源为何在 `full` 档断续丢帧** —— 5.2 那份日志的前 15 秒零丢帧、之后断续丢帧且无任何 seek/pause 事件，怀疑与外部系统负载有关（[未实证]）。若成立，则 `DROP_THRESHOLD` 需要能区分「解码喂不动」与「系统被抢」。
-5. **`frame-drop-count` 语义是否含容器可变帧率（VFR）导致的正常丢帧？** 若是，动画/VFR 片会被误判。
-6. **1440p / 2.5K（2560-3799）落 `full` 档**，`cscale=ewa` 在降采样场景白跑。比 4K 轻 4 倍大概率无碍，但未测。
-7. **有没有更对症的原生旋钮？** 比如 mpv 是否已有原生 ABR/动态降级机制，或 `--demuxer-max-back-bytes`、解码线程优先级。有原生就该替换这套手写闭环。
-8. **档位是否该写进 `mpv.conf` 的 `profile` 而不是 Lua 逐属性 set？** 更可维护，但受限于坑①。
-9. ~~`--vo=null` 下的验证能否代表真实渲染路径？~~ → **已部分回答**：5.2 用的是真实 `gpu-next` 渲染路径的日志，暴露了 `--vo=null` 完全测不到的 shader 编译成本（坑⑮）。结论：**人工负载验证机制，真实负载验证参数，两者不可互替。**
+3. **[最高] 修好值之后，应急档在真实 4K DV 播放里到底能不能救场？** —— v5.8 把非法值修掉了（坑⑯），吞吐测试也从 20.4 提升到 33.1 fps（> 片源 24 fps）。但**吞吐达标 ≠ 体验达标**：真实播放还要叠上 `video-sync=display-resample`、present、跨 GPU 输出、以及外部系统负载。需要找一部 4K DV 完整播一场，用 `logcheck.py` 确认「降档后丢帧真的归零」。**这是当前最该做的一件事。**
+4. **[高] 阈值仍未标定** —— 真实数据把范围收窄了：真实触发时的丢帧率是 **2.0 / 5.64 / 6.64 帧/s**，`DROP_THRESHOLD=1.0` 会抓住全部三次，但第一次（2.0/s）是否**该**触发存疑。还需在**已知流畅**的片子上跑一场，用 `logcheck.py` 看采样分布，确认不会把 24fps→60Hz 的正常抖动误判成卡。
+5. **720p 轻片源为何在 `full` 档断续丢帧** —— 5.2 那份日志的前 15 秒零丢帧、之后断续丢帧且无任何 seek/pause 事件，怀疑与外部系统负载有关（[未实证]）。若成立，则 `DROP_THRESHOLD` 需要能区分「解码喂不动」与「系统被抢」。
+6. **`frame-drop-count` 语义是否含容器可变帧率（VFR）导致的正常丢帧？** 若是，动画/VFR 片会被误判。
+7. **1440p / 2.5K（2560-3799）落 `full` 档**，`cscale=ewa` 在降采样场景白跑。比 4K 轻 4 倍大概率无碍，但未测。
+8. **有没有更对症的原生旋钮？** 比如 mpv 是否已有原生 ABR/动态降级机制，或 `--demuxer-max-back-bytes`、解码线程优先级。有原生就该替换这套手写闭环。
+9. **档位是否该写进 `mpv.conf` 的 `profile` 而不是 Lua 逐属性 set？** 更可维护，但受限于坑①。
+10. ~~`--vo=null` 下的验证能否代表真实渲染路径？~~ → **已部分回答**：5.2 用的是真实 `gpu-next` 渲染路径的日志，暴露了 `--vo=null` 完全测不到的 shader 编译成本（坑⑮）。结论：**人工负载验证机制，真实负载验证参数，两者不可互替。**
 
 ---
 
