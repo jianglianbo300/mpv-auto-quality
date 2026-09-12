@@ -1,0 +1,15 @@
+# 本机配置备份（含个人路径/偏好，不入库）
+*.bak
+*.bak-*
+mpv.conf.bak*
+
+# 观看记录与缓存
+watch_later/
+cache/
+*.log
+*.tmp
+
+# 编辑器
+.vscode/
+.idea/
+*~

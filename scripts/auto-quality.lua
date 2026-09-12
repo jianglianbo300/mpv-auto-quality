@@ -1,0 +1,177 @@
+-- auto-quality.lua v5.4 (2026-09-13 Nyx)
+-- 单写者自动画质档 = 分辨率定基线（v4 路线，9-06 实测有效）+ 丢帧率闭环自适应（v5 新增）。
+--
+-- 为什么必须单写者: 外挂第二个按丢帧切档的脚本(auto-smooth.lua)会与 v4 抢同一批属性，
+--   且 mpv 按文件名顺序加载脚本、后加载者赢 —— 4K 打开时 v4 轻量档会被覆盖回满血
+--   （正中 9-06 实测 46% 丢帧的坑）。故升降档逻辑全部收进本脚本。
+--
+-- 版本演进:
+--   v5    丢帧状态机并入 v4（单写者）
+--   v5.1  每档必须列全 KEYS，否则降过应急档再回升时 scale 永久停在 fast_bilinear
+--   v5.2  ① 切档函数不能叫 goto（mpv 内嵌 LuaJIT 保留字，v5 加载即语法错误）
+--         ② mp.set_property 成功返回 nil、失败抛错 → 必须 pcall（否则每键误报警）
+--         ③ 属性值统一字符串 yes/no（对齐 v4 实测路径）
+--         ④ full 档 interpolation 改 "no" —— v4 的 full 表重开插帧，与 9-06 审计结论冲突
+--            （桌面 GPU 被抢占时插帧是丢帧放大器；当时 mpv.conf 已改 interpolation=no，脚本漏改）
+--   v5.3 恢复 v4 的 width 三路触发（file-loaded 时 width 可能仍为 0 → 4K 会误判成满血档）
+--   v5.4 手动键 Ctrl+d / Ctrl+i 收进本脚本：按键时自动关掉自动档。
+--        原因：这两个键改的正是本脚本托管的那批属性，而 enter() 每次换档会按
+--        档位表整组重写 —— 手动改动会在下一次换档时被静默覆盖（本脚本是单写者，
+--        键位就该归它管）。原绑定在 input.conf，已移出，见该文件注释。
+--
+-- 硬件: i7-8550U + UHD620(带屏) + MX250 + 1080p SDR 屏。
+-- ⚠ 坑(勿回退): mpv 0.41 + d3d11va 下 video-params/* 全读 nil，必须用别名 width。
+
+local SAMPLE_INTERVAL  = 3      -- 秒: 丢帧采样周期
+local DROP_THRESHOLD   = 1.0    -- 平均每秒丢 >=1 帧算卡(人眼可感)
+local CONFIRM          = 2      -- 连续 N 周期超阈值才降档(防瞬时毛刺)
+local CLEAN_SECONDS    = 60     -- 应急档连续 N 秒零丢帧才试探回升
+local RECHECK_SECONDS  = 25     -- 回升后观察 N 秒, 立刻复发记一次失败
+local COOLDOWN_SECONDS = 300    -- 连续 2 次回升失败 => 冷却 N 秒不再回升
+local WIDTH_4K         = 3800   -- 4K 判定阈值（v4 沿用）
+
+-- 托管键: 每档必须显式给出每个键的值（单一事实源，防跨档残留）
+local KEYS = { "scale", "cscale", "dscale", "linear-downscaling", "deband", "interpolation" }
+
+local FULL = {                   -- 1080p 及以下: 放大场景, ewa_lanczossharp 双开(清晰度关键)
+  scale = "ewa_lanczossharp", cscale = "ewa_lanczossharp", dscale = "mitchell",
+  ["linear-downscaling"] = "yes", deband = "yes", interpolation = "no",
+}
+local LIGHT = {                  -- 4K 基线: 色度低频用 bilinear 无感; 降采样画质靠 dscale+linear
+  scale = "ewa_lanczossharp", cscale = "bilinear", dscale = "mitchell",
+  ["linear-downscaling"] = "yes", deband = "no", interpolation = "no",
+}
+local EMERGENCY = {              -- 基线仍喂不动: 砍掉 4K 降采样最大头(线性缩放)+缩放器降双线性
+  scale = "fast_bilinear", cscale = "bilinear", dscale = "bilinear",
+  ["linear-downscaling"] = "no", deband = "no", interpolation = "no",
+}
+
+local tier_table = { full = FULL, light = LIGHT, emergency = EMERGENCY }
+local tier_label = { full = "满血", light = "4K轻量", emergency = "应急(已砍缩放)" }
+
+local baseline = nil             -- 由片源分辨率决定 (full|light)
+local tier = nil                 -- 当前生效档 (full|light|emergency)
+local auto = true
+local prev_drops, prev_time = nil, nil
+local bad_streak, clean_accum = 0, 0
+local upgrade_pending, fail_count, blocked_until = nil, 0, 0
+
+local function get_num(name)
+  local ok, n = pcall(mp.get_property_number, name)
+  if ok and n then return n end
+  return nil
+end
+
+local function read_drops()
+  return get_num("frame-drop-count")
+      or get_num("decoder-frame-drop-count")
+      or get_num("vo-drop-frame-count")
+end
+
+local function set1(k, v)
+  local ok, err = pcall(mp.set_property, k, v)
+  if not ok then mp.msg.warn("auto-quality: set " .. k .. " failed: " .. tostring(err)) end
+end
+
+local function enter(new_tier, why)
+  if tier == new_tier then return end
+  tier = new_tier
+  local t = tier_table[new_tier]
+  for _, k in ipairs(KEYS) do set1(k, t[k]) end
+  bad_streak, clean_accum = 0, 0
+  mp.msg.warn(string.format("AUTO-QUALITY -> %s (%s)", new_tier, why))
+  mp.osd_message("画质档: " .. tier_label[new_tier] .. " (" .. why .. ")", 2)
+end
+
+-- 分辨率 → 基线档。width 未知(0)时不改判，等 video-reconfig/observe 补触发。
+local function pick_baseline(why)
+  local w = get_num("width") or 0
+  if w <= 0 then return end
+  local nb = (w >= WIDTH_4K) and "light" or "full"
+  if nb ~= baseline then
+    baseline = nb
+    tier = nil            -- 基线变了 => 允许重新套用（含从 emergency 回落到新基线）
+    enter(nb, why .. " width=" .. tostring(w))
+  end
+end
+
+mp.register_event("file-loaded", function()
+  prev_drops, prev_time = read_drops(), mp.get_time()
+  bad_streak, clean_accum, upgrade_pending = 0, 0, nil
+  fail_count, blocked_until = 0, 0
+  pick_baseline("新片源")
+end)
+
+-- v4 教训: file-loaded 时 width 常还没解析出来，必须三路触发兜底
+mp.register_event("video-reconfig", function() pick_baseline("画面重配置") end)
+mp.observe_property("width", "number", function() pick_baseline("宽高探测") end)
+
+mp.add_periodic_timer(SAMPLE_INTERVAL, function()
+  if not auto or not prev_time or not tier or not baseline then return end
+  local now = mp.get_time()
+  local drops = read_drops()
+  if not drops then return end
+  local dt = now - prev_time
+  if dt <= 0 then return end
+  local rate = (drops - prev_drops) / dt
+  prev_drops, prev_time = drops, now
+  local stutter = rate > DROP_THRESHOLD
+
+  if tier == baseline then
+    if stutter then
+      bad_streak = bad_streak + 1
+      if upgrade_pending then                    -- 回升试探期内复发 => 回滚+计失败
+        fail_count = fail_count + 1
+        upgrade_pending = nil
+        if fail_count >= 2 then blocked_until = now + COOLDOWN_SECONDS end
+        enter("emergency", "回升后复发")
+      elseif bad_streak >= CONFIRM then
+        enter("emergency", string.format("丢帧%.1f/s", rate))
+      end
+    else
+      bad_streak = 0
+      if upgrade_pending and now - upgrade_pending >= RECHECK_SECONDS then
+        upgrade_pending, fail_count = nil, 0     -- 试探通过
+      end
+    end
+  else                                           -- emergency: 够干净才试探回升
+    if stutter then
+      clean_accum = 0
+    else
+      clean_accum = clean_accum + dt
+      if now >= blocked_until and clean_accum >= CLEAN_SECONDS then
+        enter(baseline, "自动回升")
+        upgrade_pending = now
+      end
+    end
+  end
+end)
+
+mp.add_key_binding("ctrl+a", "toggle-auto-quality", function()
+  auto = not auto
+  mp.osd_message("自动画质档: " .. (auto and "开" or "关"), 2)
+end)
+
+-- v5.4 手动覆盖：改托管属性前先关掉自动档，否则下一次换档会整组写回。
+-- 返回 true 表示本次确实关掉了自动档（用于拼 OSD 提示）。
+local function manual_override()
+  if not auto then return false end
+  auto = false
+  return true
+end
+
+mp.add_key_binding("ctrl+d", "toggle-deband-manual", function()
+  local was_auto = manual_override()
+  local on = mp.get_property_native("deband")
+  set1("deband", on and "no" or "yes")
+  mp.osd_message("deband: " .. (on and "关" or "开") ..
+                 (was_auto and " ｜ 自动画质档已关" or ""), 3)
+end)
+
+mp.add_key_binding("ctrl+i", "toggle-interpolation-manual", function()
+  local was_auto = manual_override()
+  local on = mp.get_property_native("interpolation")
+  set1("interpolation", on and "no" or "yes")
+  mp.osd_message("interpolation: " .. (on and "关" or "开") ..
+                 (was_auto and " ｜ 自动画质档已关" or ""), 3)
+end)
