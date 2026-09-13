@@ -1,4 +1,4 @@
--- auto-quality.lua v5.8 (2026-09-13 Nyx)
+-- auto-quality.lua v5.9.1 (2026-09-13 Nyx)
 -- 单写者自动画质档 = 分辨率定基线（v4 路线，9-06 实测有效）+ 丢帧率闭环自适应（v5 新增）。
 --
 -- 为什么必须单写者: 外挂第二个按丢帧切档的脚本(auto-smooth.lua)会与 v4 抢同一批属性，
@@ -56,6 +56,15 @@
 --            校验每个字符串值是否为当前后端合法值，非法则 error 级告警。
 --            时机放在 file-loaded（此时 VO 已就绪、choices 可读）；
 --            只有真的读到 choices 才算校验过，否则留待下次触发重试。
+--   v5.9  【已回退，勿恢复】曾把 4K 基线改成「独显感知」：
+--            uses_dgpu()（读 options/d3d11-adapter 含 nvidia）→ full，否则 light。
+--            45s 短测通过（独显 tier=full 零丢帧；核显仍正确回落 light），
+--            但 12min 长测证明**长片撑不住**，故 v5.9.1 回退为 light。详见文件内注释。
+--   v5.9.1 回退 4K 基线为 light。依据：独显+full 12min 长测
+--            0-6min 零丢帧 → 6-8min 0.33/s → 8min 被迫降 emergency
+--            → 10-12min 仍 2.11/s（**降档也救不回来**，此时瓶颈已是 CPU 软解热节流）。
+--            对比 独显+light 12min 全程 0.16/s 零退化。
+--            教训：**短测通过 ≠ 长片可用**，本机热积累约 6min 才越界。
 --
 -- 硬件: i7-8550U + UHD620(带屏) + MX250 + 1080p SDR 屏。
 -- ⚠ 坑(勿回退): mpv 0.41 + d3d11va 下 video-params/* 全读 nil，必须用别名 width。
@@ -208,6 +217,17 @@ local function enter(new_tier, why)
   mp.osd_message("画质档: " .. tier_label[new_tier] .. " (" .. why .. ")", 2)
   publish()
 end
+
+-- ⚠ v5.9「独显→4K 用 full 档」已回退（v5.9.1，2026-09-13 14:00），不要恢复。
+--   起因：45s 短测下 独显+full = 0 丢帧（看起来完全可行），于是把 4K 基线改成独显感知。
+--   但 12 min 长测证明**长片撑不住**：
+--       独显 + full ：0-6 min 零丢帧（0.02/0.00/0.00）→ 6-8 min 0.33 → 8 min 被降到 emergency
+--                     → 10-12 min 仍 2.11 帧/秒（**降档也救不回来**，此时瓶颈已是 CPU 软解热节流）
+--       独显 + light：12 min 全程 0.16 帧/秒，稳定
+--   结论：full 只适合短片（<6 min）；长片必须 light，因为 full 的 GPU 侧开销会推高总发热，
+--         挤掉本就吃紧的 CPU 软解热预算。基线保守取 light。
+--   教训：**45 s 短测通过 ≠ 长片可用**，热积累需要 6 min 以上才显现。
+--         （若将来要开，判定函数见 git 历史 / 32.2 节，但需配合更长的观察窗与更快降档。）
 
 -- 分辨率 → 基线档。width 未知(0)时不改判，等 video-reconfig/observe 补触发。
 local function pick_baseline(why)

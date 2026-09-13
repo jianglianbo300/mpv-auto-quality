@@ -117,19 +117,35 @@ hdr-compute-peak=no      # 关掉逐帧片源峰值计算
 
 **那"偏紫/发灰"到底是谁修的？** 是上面那三个旋钮 + `vo=gpu-next`。色调映射的目标色彩空间来自**显示器上报值**（`d3d11_target_color_space()` 读 `DXGI_OUTPUT_DESC1`），不是由这两行决定的。
 
-### 3.3 关于 `video-sync=display-resample`
+### 3.3 `video-sync`：从 `display-resample` 改成了 `audio`
 
 ```ini
-video-sync=display-resample
+video-sync=audio
 ```
 
-它解决的是 **A/V 漂移和偶发丢帧**（音频重采样去补偿视频时钟），但**不能消除 24p 在 60Hz 屏上的 3:2 抖动**。
+> ⚠ **2026-09-13 修订：本仓库原本推荐 `display-resample`，现已改为 `audio`。**
 
-官方文档原文（`--video-sync-max-video-change` 一节）：
+`display-resample` 承诺解决 **A/V 漂移和偶发丢帧**（音频重采样去补偿视频时钟）。但实测下来它在这台机器上是**纯负收益**：
 
-> Playing 24 fps video on a 60 Hz screen will play video in a 2-3-2-3-... pattern.
+| `video-sync` | 4K DV 真丢帧（45s/次，6 次对照） |
+|---|---|
+| `display-resample`（旧值） | 0.09 / 0.11 / **2.20 / 2.49** 帧/秒 —— 间歇性爆发 |
+| `audio`（新值，也是 mpv 默认） | **6 次全部 0.00** |
 
-2-3-2-3 就是 3:2 pulldown 本身。真要消除它只有两条路：开 `interpolation=yes`（时间轴插值），或者把屏幕切成 48/120Hz。本仓库选择关插帧，理由见第 4 节。
+顺序效应已排除（交替顺序跑了 3 组，其中一组让 `audio` 先跑、机器更凉，`resample` 仍不是最低）。
+
+**两条理由：**
+
+1. **它承诺的平滑，在 24fps@60Hz 屏上根本兑现不了。** 官方文档原文（`--video-sync-max-video-change` 一节）：
+   > Playing 24 fps video on a 60 Hz screen will play video in a 2-3-2-3-... pattern.
+
+   2-3-2-3 就是 3:2 pulldown 本身 —— **抖动照旧**。真要消除只有两条路：开 `interpolation=yes`（时间轴插值），或把屏幕切成 48/120Hz。
+
+2. **但它对时序要求更严格 → 来不及就丢帧**，实测引入 0.1~2.5 帧/秒真丢帧。
+
+**既没兑现平滑，又引入卡顿 → 砍掉。** 改用 `audio`（以音频时钟为准，也是 mpv 默认值）后代价只有一条：3:2 抖动照旧——但这与浏览器 / 电视 / 其他播放器一致，且远好于"掉帧"这种硬卡顿。
+
+> **这一条的收益远不止"去掉一个选项"**：它同时也是下面 4.4 节里"独显更卡"那个错误结论的**真正主因**。改完之后，独显方案从"热态崩"变成"12 分钟长片 0.16 帧/秒"。详见 4.4 与坑 ⑳。
 
 ---
 
@@ -223,6 +239,70 @@ local WIDTH_4K         = 3800   -- 4K 判定阈值
 
 **本机现状（2026-09-13 起）**：已在 `mpv.conf` 中设置 `d3d11-adapter="NVIDIA GeForce MX250"` —— 实测日志确认 `Device Name: NVIDIA GeForce MX250`，吞吐 18.3 fps（核显 17.8，+2.9%）。想切回核显，注释掉该行即可。
 
+---
+
+#### ⚠⚠ 4.4.1 重大修正（2026-09-13）：上面那句"硬解跑起来了"是**读错日志**
+
+上面写"第二次测量日志确认硬解**真的跑起来了**（`Loading hwdec driver 'cuda'` + `Device Name: NVIDIA GeForce MX250`）"——**这个是错的**，而且错得很典型。
+
+**MX250 在这台机器上根本不能硬件解码。** 重启后 + `GpuPreference=2`（独显优先）双条件下重跑的完整矩阵：
+
+| 组合 | 渲染卡 | 解码结果 |
+|---|---|---|
+| `d3d11va` | MX250 | **software** |
+| `vulkan + nvdec` | MX250 | **software** |
+| `vulkan + auto` | MX250 | **software** |
+| `dxva2` | MX250 | **software** |
+| `d3d11va` | UHD 620 | **hardware** ✅ |
+
+4K DV 与 1080p H.264 都一样。失败链路：
+
+```
+[vd] Trying hardware decoding via hevc-d3d11va.    ← 只是【尝试】
+[ffmpeg/video] hevc: No decoder device for codec found
+[vd] Attempting next decoding method after failure of hevc-d3d11va.
+[vd] Using software decoding.                       ← 【结果】
+[vd] Requesting 9 threads for decoding.
+```
+
+**错在哪**：`Loading hwdec driver 'cuda'` 和 `Trying hardware decoding` 都是**过程日志**，不代表成功。
+判定硬解必须找**结果态**那一行（详见坑 ⑰）。
+
+**根因不在硬件**：NVIDIA 官方明确 Fermi 及以后的 GPU 都带 NVDEC（Pascal/MX 系列含在内）。
+但 `nvidia-smi` 恒 `Failed to initialize NVML: Unknown Error` —— **连 NVIDIA 自家的工具都管不了这块卡**。
+驱动 32.0.15.8266、NVIDIA 服务 Running、设备 `Status=OK`、重启无效 → 是驱动/系统状态层的问题。
+
+**所以本仓库的 `mpv.conf` 不写 `d3d11-adapter`**，让 mpv 用默认适配器（核显）以保住硬解。
+（本机因为别的原因单独设了独显，那是特例；对多数人不适用。）
+
+#### 4.4.2 独显到底能不能用 —— 能，但代价是 CPU
+
+修正一个更早的裁决：曾经判定"全独显热态差 10~37 倍、勿用"。**那个裁决是在 `video-sync=display-resample` 下测的，已作废。**
+
+改成 `video-sync=audio` 后，独显软解 12 分钟长测：
+
+| 时间段 | 0-2 | 2-4 | 4-6 | 6-8 | 8-10 | 10-12 min |
+|---|---|---|---|---|---|---|
+| 丢帧/秒 | 0.66 | 0.08 | 0.04 | 0.02 | **0.00** | 0.17 |
+
+平均 **0.16 帧/秒**，**零热退化**（丢帧率随时间下降，不是上升）。对比 `display-resample` 时代的 5.18/s —— **差 30 倍**。
+
+**真凶是 `display-resample` 与软解的叠加，不是独显软解本身。**
+
+但代价是实打实的：
+
+| | 独显 MX250（软解） | 核显 UHD 620（硬解） |
+|---|---|---|
+| mpv 进程 CPU | **268%** | **17.5%** |
+| 12 min 丢帧 | 0.16 帧/秒 | 0 |
+
+**差 15 倍 CPU** → 功耗 / 发热 / 风扇 / 续航。所以：
+**核显仍是效率最优**；独显方案"能用"，适合插电场景。
+
+> ⚠ 顺带一个反直觉点：**CPU 占用低不等于更轻松**。
+> `full` 档丢帧 17.5/s 时 CPU 只有 10.9%，`emergency` 档零丢帧时 CPU 反而 18.4% ——
+> 因为 full 档 GPU 是瓶颈，**CPU 在干等**。详见坑 ⑲。
+
 **真正的瓶颈是「4K 本身」，不是「哪块 GPU」：**
 
 | 片源 | 渲染吞吐 |
@@ -285,6 +365,16 @@ local WIDTH_4K         = 3800   -- 4K 判定阈值
 | 应急档原先的 `scale="fast_bilinear"` 是**非法值** → 降档静默失效（v5.8 已修 + 加自检） | [实证] |
 | `tone-mapping=clip` 对 4K DV 吞吐**无增益**（33.0 vs 33.1 fps） | [实证] |
 | `option-info/<名>/choices` 可作为选项合法性的运行时校验源 | [实证] |
+| **`video-sync=display-resample` 会引入丢帧**：6 次对照 0.09/0.11/2.20/2.49 帧/秒；改 `audio` 后 6 次全 0 | [实证] |
+| **MX250 在本机无法硬件解码**：`d3d11va`/`nvdec`/`vulkan+nvdec`/`opengl+cuda`/`dxva2` 全软解；`nvidia-smi` 恒 NVML 失败；重启 + `GpuPreference=2` 双条件下复验一致 | [实证] |
+| **独显软解 + `audio` 12 分钟长测**：平均 0.16 帧/秒，零热退化（对比 `display-resample` 时代 5.18/s，差 30 倍） | [实证] |
+| **独显软解 CPU 268% vs 核显硬解 17.5%**（差 15 倍），两者凉机短时都不丢帧 | [实证] |
+| **`cscale` 是 4K 性能主宰**：`ewa_lanczossharp`→`bilinear` 丢帧 13.85→0.35（40 倍）；关 `deband` 只改善 22% | [实证] |
+| **`scale` 在 4K→1080p 降采样下不生效**（缩小走 `dscale`），改它是无效操作 | [实证] |
+| **画质越好 CPU 越低**（3 轮一致）：full 10.9% 但丢帧 17.5/s；emergency 18.4% 但零丢帧 | [实证] |
+| **4K `full` 档长片会热退化**：0-6min 零丢帧 → 8min 降 emergency → 10-12min 仍 2.11/s | [实证] |
+| 1440p / 2.5K 落 `full` 档是否合理 | [未实证] |
+| 720p 轻片源在 `full` 档断续丢帧的真实原因 | [未实证] |
 
 ### 5.1 闭环验证是怎么做出来的
 
@@ -402,6 +492,46 @@ emergency 稳定 60s（丢帧全 0）
 　　防御（v5.8 已实施）：mpv 把每个选项的合法值暴露在**只读**属性 `option-info/<名>/choices` 上（`scale` 39 个、`cscale`/`dscale` 各 40 个；`deband`/`interpolation` 这类 flag 没有 choices，跳过）。启动时逐个比对档位表，不合法就 `mp.msg.error` 点名报出。**该属性随当前 VO 变化**，所以换回旧 `vo=gpu` 时自检会自动适配。
 　　**普适推论：凡「把配置值写进代码再交给程序执行」的地方，都要有一步「程序认不认这个值」的校验 —— 否则错误会被执行层吞掉，只在行为上留下一个说不清的「没生效」。**
 
+⑰ **判定硬件解码是否生效，必须找「结果态」那一行 —— `Trying` 不是成功**（真实踩到，直接导致 4.4 节那版错误结论）：日志里有两行都会匹配 `(hardware|software) decoding`：
+
+```
+[vd] Trying hardware decoding via hevc-d3d11va.   ← 【尝试】，不代表成功
+[vd] Using software decoding.                      ← 【结果】，这才是结论
+```
+
+用 `grep -m1 -oE "(hardware|software) decoding"` 会命中第一行，**把失败报成成功**。
+正确写法：`grep -oE "Using (hardware|software) decoding" log | tail -1`。
+同理 `Loading hwdec driver 'cuda'` 打印成功 ≠ cuda 可用。**Trying / Attempting / Requesting / Loading 都是过程动词，永远不能当结论。**
+本次是靠"硬解成功但 CPU 230%"这个矛盾发现的 —— **两个指标打架时，一定有一个读错了，别挑好看的那个信。**
+
+⑱ **4:2:0 片源的 `cscale` 才是 4K 性能主宰，不是 `scale`**：4K→1080p 是**缩小**，luma 走 `dscale`，所以 `scale`（luma 放大）**根本不参与** —— 应急档把 `scale` 降到 bilinear 是**无效操作**（不提速也不降画质）。但 chroma 是半分辨率（4:2:0），转 RGB 时必须**放大**到全画面 → 走 `cscale`，每帧全画面运算。实测 `cscale` 从 `ewa_lanczossharp` 换 `bilinear`：丢帧 **13.85 → 0.35 帧/秒（40 倍）**；而关掉 `deband` 只改善 22%。
+**推论：屏幕 1080p、片源 ≥1080p 时，`scale` 这项基本是摆设。**
+
+⑲ **CPU 占用低 ≠ 更轻松**（反直觉，3 轮 100% 一致）：`full` 档（画质最好）CPU 仅 **10.9%** 却丢帧 **17.5/s**；`emergency` 档（画质最差）CPU **18.4%** 反而零丢帧。原因是 full 档 GPU 是瓶颈，**CPU 大部分时间在干等 GPU**。
+→ **「降档 → 省 CPU → 降温 → 不卡」这条链不成立。** 降档的唯一真实收益是**减 GPU 负载 → 减丢帧**。
+→ CPU 占用高往往是"跟得上"的标志。负担指标和结果指标必须一起看。
+
+⑳ **`video-sync=display-resample` 是高负载下的丢帧放大器**：见 3.3 节。6 次对照中它有间歇性爆发（最高 2.49 帧/秒），`audio` 6 次全零。
+**这条最值得记住的点是：它让一个原本正确的性能裁决（"全独显更差"）整整错了一轮** —— 换成 `audio` 后，同一套独显配置从 5.18 帧/秒变成 0.16 帧/秒（**差 30 倍**）。
+
+㉑ **短测通过 ≠ 长片可用，档位决策的验证窗必须 ≥ 10 分钟**：v5.9 曾把 4K 基线改成"独显时用 `full`"，45 秒短测**零丢帧**（看起来完全可行）。但 12 分钟长测：
+
+| 时间 | 0-2 | 2-4 | 4-6 | 6-8 | 8-10 | 10-12 min |
+|---|---|---|---|---|---|---|
+| 丢帧/秒 | 0.02 | 0.00 | 0.00 | 0.33 | 1.07 | **2.11** |
+| 档位 | full | full | full | full | **emergency** | emergency |
+
+**前 6 分钟完美，之后崩**；而且降到 emergency 后**继续恶化**（此时瓶颈已是 CPU 软解热节流，再降画质也没用）。
+本机**热积累约 6 分钟才越界**。→ 任何升/降画质的改动，观察窗 < 10 分钟的结论一律不算数。
+
+㉒ **三个测量细节，踩一个就白测**：
+- **读生效值用 `tail -1`**：mpv.conf 里同名项写两次时**末尾覆盖**，`grep -m1` 取到的是错误值（本次三档全显示同一个值，差点误判"档位没锁住"）。
+- **CPU 必须用进程级计数器**：`\Processor(_Total)` 会把 mpv 的差异稀释成噪声（实测三档全是 24%，无差异）；换 `\Process(mpv)\% Processor Time` 立刻分出 10.9 / 17.4 / 18.4。另：启动后**预热 8 秒**再采样，跳过启动突刺。
+- **退出事件里读属性恒为 nil**：`shutdown` / `end-file` 时 `frame-drop-count` 已失效。要统计丢帧必须**播放中周期性采样写盘**（`mp.add_periodic_timer`）。
+
+㉓ **瓶颈会随配置转移，归因结论不能跨配置复用**：同一个 4K 片源的 `full` 档，在**核显硬解**下丢帧 **17.5/s**，在**独显软解**下是 **0**（45s 内）。核显时瓶颈在 GPU 渲染 → `cscale` 是主宰；独显时瓶颈转到 CPU 软解 → GPU 侧开销根本不是瓶颈（full 与 light 的 CPU 都是 ~250%）。
+**→ 「X 是性能主宰」必须写明当时的解码方式 / 渲染卡，否则换个配置就作废。**
+
 ---
 
 ## 7. 诊断：怎么知道闭环有没有动
@@ -478,7 +608,11 @@ python tools/mpvctl.py get user-data/auto-quality/auto    # 自动档还开着�
 
 1. ~~**[最高] 闭环未验证**~~ → **✅ 已解决（见 5.1 + 5.2）**：`tools/loop_test.py` 用 IPC 控制 `speed` 构造可控负载双向跑通；随后一份真实播放日志（3 分 25 秒）确认降档 / 回升 / 冷却三条路径在真实负载下全部触发。
 2. ~~**[最高] 振荡修复未实施**~~ → **✅ 已修复（v5.7 静默期，见 5.2）**，回归测试通过；**但尚未在真实 `gpu-next` 渲染路径上复验**（`--vo=null` 绕过 shader 编译）—— 下次真实播放看 `logcheck.py` 是否还出现「回升后复发」即可结案。
-3. **[最高] 修好值之后，应急档在真实 4K DV 播放里到底能不能救场？** —— v5.8 把非法值修掉了（坑⑯），吞吐测试也从 20.4 提升到 33.1 fps（> 片源 24 fps）。但**吞吐达标 ≠ 体验达标**：真实播放还要叠上 `video-sync=display-resample`、present、跨 GPU 输出、以及外部系统负载。需要找一部 4K DV 完整播一场，用 `logcheck.py` 确认「降档后丢帧真的归零」。**这是当前最该做的一件事。**
+3. ~~**[最高] 修好值之后，应急档在真实 4K DV 播放里到底能不能救场？**~~ → **✅ 已回答（2026-09-13，且答案推翻了当时的担忧）**：4K DV 完整播了 12 分钟，`light` 档全程 **0.16 帧/秒、零热退化**。
+   关键发现是：当时担心"真实播放还要叠上 `video-sync=display-resample` 的开销"——**这个担心是对的，而且它就是主因**。
+   `display-resample` 改成 `audio` 后，独显软解的长片表现从 5.18 帧/秒变成 0.16 帧/秒（**差 30 倍**），见 3.3 节与坑 ⑳。
+   **结论：吞吐达标 + `video-sync=audio` → 体验达标。**
+3b. **[高] 新发现：`full` 档在 4K 长片上会热退化** —— 0-6 min 零丢帧，8 min 被迫降 emergency，10-12 min 仍 2.11/s（降档也救不回来）。因此 4K 基线保守取 `light`（v5.9 尝试过自动升 `full`，已回退，见坑 ㉑）。**未解决的是：能否找到一个"比 light 好、又比 full 稳"的中间档？**（例如 light + 开 `deband` 实测会涨到 1.18~4.64 帧/秒，不可行。）
 4. **[高] 阈值仍未标定** —— 真实数据把范围收窄了：真实触发时的丢帧率是 **2.0 / 5.64 / 6.64 帧/s**，`DROP_THRESHOLD=1.0` 会抓住全部三次，但第一次（2.0/s）是否**该**触发存疑。还需在**已知流畅**的片子上跑一场，用 `logcheck.py` 看采样分布，确认不会把 24fps→60Hz 的正常抖动误判成卡。
 5. **720p 轻片源为何在 `full` 档断续丢帧** —— 5.2 那份日志的前 15 秒零丢帧、之后断续丢帧且无任何 seek/pause 事件，怀疑与外部系统负载有关（[未实证]）。若成立，则 `DROP_THRESHOLD` 需要能区分「解码喂不动」与「系统被抢」。
 6. **`frame-drop-count` 语义是否含容器可变帧率（VFR）导致的正常丢帧？** 若是，动画/VFR 片会被误判。
